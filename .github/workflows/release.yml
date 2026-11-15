@@ -4,35 +4,50 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example, v0.1.0)
+        type: string
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
     name: Validate release tag
-    if: github.ref_type == 'tag' && !github.event.deleted
+    if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && !github.event.deleted)
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Check tag and POM versions
-        id: version
+      - name: Check tag format
         shell: bash
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Expected a release tag in the form vMAJOR.MINOR.PATCH."
             exit 1
           fi
-          version="${GITHUB_REF_NAME#v}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+
+      - name: Check POM versions and record build commit
+        id: version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
           python3 - "$version" <<'PY'
           import sys
           import xml.etree.ElementTree as ET
@@ -47,11 +62,15 @@ jobs:
                   sys.exit(f"{pom}: expected version {expected}, found version={version}, parent={parent_version}")
           PY
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          commit=$(git rev-parse 'HEAD^{commit}')
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   compatibility:
     name: Verify JDK compatibility
     needs: validate
     uses: ./.github/workflows/ci.yml
+    with:
+      commit: ${{ needs.validate.outputs.commit }}
 
   package:
     name: Build release assets
@@ -62,6 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
 
       - uses: actions/setup-java@v6
@@ -125,39 +145,70 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
-          if grep -Fxq -- "$GITHUB_REF_NAME" <<< "$tags"; then
-            echo "::error::A release or draft already exists for this tag."
-            exit 1
-          fi
-
           files=(release/assets/*)
           if [[ "${#files[@]}" -ne 6 || ! -s release/notes.md || ! -s release/commit ]]; then
             echo "::error::Expected six release files, release notes, and a build commit."
             exit 1
           fi
           commit=$(cat release/commit)
+          repo_api="repos/$GITHUB_REPOSITORY"
           require_current_tag() {
-            current=$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$GITHUB_REF_NAME" --jq '.sha')
-            if [[ "$current" != "$commit" ]]; then
+            local object sha
+            object=$(gh api "$repo_api/git/ref/tags/$RELEASE_TAG" --jq '.object')
+            while [[ $(jq -r '.type' <<< "$object") == tag ]]; do
+              sha=$(jq -er '.sha' <<< "$object")
+              object=$(gh api "$repo_api/git/tags/$sha" --jq '.object')
+            done
+            if ! jq -e --arg commit "$commit" '.type == "commit" and .sha == $commit' <<< "$object" > /dev/null; then
               echo "::error::The tag no longer points to the commit used to build these assets."
               exit 1
             fi
           }
-          require_current_tag
-          draft_url=$(gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --draft --target "$commit" --title "BeeKit $GITHUB_REF_NAME" --notes-file release/notes.md)
 
-          expected=$(printf '%s\n' "${files[@]##*/}" | sort)
-          draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId,url,isDraft,assets)
-          uploaded=$(jq -r --arg url "$draft_url" 'select(.isDraft and .url == $url)
-            | .assets[] | select(.state == "uploaded" and .size > 0) | .name' <<< "$draft" | sort)
-          if [[ "$uploaded" != "$expected" ]]; then
-            echo "::error::Draft is missing expected release assets."
+          require_current_tag
+          release_ids=$(gh api --paginate "$repo_api/releases?per_page=100" |
+            jq -cs --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag) | .id]')
+          case $(jq 'length' <<< "$release_ids") in
+            0)
+              gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --verify-tag --draft --target "$commit" --title "BeeKit $RELEASE_TAG" --notes-file release/notes.md
+              release_id=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json databaseId,isDraft --jq 'select(.isDraft) | .databaseId')
+              ;;
+            1) release_id=$(jq -er '.[0]' <<< "$release_ids") ;;
+            *)
+              echo "::error::Multiple releases match $RELEASE_TAG."
+              exit 1
+              ;;
+          esac
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Unable to identify the release for $RELEASE_TAG."
             exit 1
           fi
 
-          draft_id=$(jq -er '.databaseId | select(type == "number" and . > 0)' <<< "$draft")
-          require_current_tag
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$draft_id" \
-            -f tag_name="$GITHUB_REF_NAME" -F draft=false --jq '.html_url'
+          assets=$(gh api --paginate "$repo_api/releases/$release_id/assets?per_page=100" | jq -cs 'add')
+          missing=()
+          for file in "${files[@]}"; do
+            if ! jq -e --arg name "${file##*/}" 'any(.[]; .name == $name)' <<< "$assets" > /dev/null; then
+              missing+=("$file")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            require_current_tag
+            gh release upload "$RELEASE_TAG" "${missing[@]}" --repo "$GITHUB_REPOSITORY"
+          fi
+
+          assets=$(gh api --paginate "$repo_api/releases/$release_id/assets?per_page=100" | jq -cs 'add')
+          for file in "${files[@]}"; do
+            if ! jq -e --arg name "${file##*/}" 'any(.[]; .name == $name and .state == "uploaded" and .size > 0)' \
+              <<< "$assets" > /dev/null; then
+              echo "::error::Release asset missing or incomplete: ${file##*/}."
+              exit 1
+            fi
+          done
+          is_draft=$(gh api "$repo_api/releases/$release_id" --jq '.draft')
+          if [[ "$is_draft" == true ]]; then
+            require_current_tag
+            gh api --method PATCH "$repo_api/releases/$release_id" \
+              -f tag_name="$RELEASE_TAG" -F draft=false --jq '.html_url'
+          fi
