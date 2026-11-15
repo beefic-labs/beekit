@@ -171,7 +171,7 @@ jobs:
           case $(jq 'length' <<< "$release_ids") in
             0)
               gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-                --verify-tag --draft --target "$commit" --title "BeeKit $RELEASE_TAG" --notes-file release/notes.md
+                --verify-tag --draft --title "BeeKit $RELEASE_TAG" --notes-file release/notes.md
               release_id=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
                 --json databaseId,isDraft --jq 'select(.isDraft) | .databaseId')
               ;;
@@ -210,5 +210,5 @@ jobs:
           if [[ "$is_draft" == true ]]; then
             require_current_tag
             gh api --method PATCH "$repo_api/releases/$release_id" \
-              -f tag_name="$RELEASE_TAG" -F draft=false --jq '.html_url'
+              -F draft=false --jq '.html_url'
           fi
