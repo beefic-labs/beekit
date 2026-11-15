@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    if: github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check tag and POM versions
+        id: version
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a release tag in the form vMAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = sys.argv[1]
+          ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+          for pom in ("pom.xml", "beekit-bom/pom.xml", "beekit-oss/pom.xml"):
+              project = ET.parse(pom).getroot()
+              version = project.findtext("m:version", namespaces=ns)
+              parent_version = project.findtext("m:parent/m:version", namespaces=ns)
+              if (version or parent_version) != expected or (pom != "pom.xml" and parent_version != expected):
+                  sys.exit(f"{pom}: expected version {expected}, found version={version}, parent={parent_version}")
+          PY
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  compatibility:
+    name: Verify JDK compatibility
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: Build release assets
+    needs: [validate, compatibility]
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build release
+        run: mvn --batch-mode --no-transfer-progress -Prelease clean verify
+
+      - name: Stage release assets and notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          mkdir -p target/release/assets
+          for suffix in .jar -sources.jar -javadoc.jar; do
+            file="beekit-oss-${VERSION}${suffix}"
+            test -s "beekit-oss/target/$file"
+            cp "beekit-oss/target/$file" "target/release/assets/$file"
+          done
+          cp pom.xml "target/release/assets/beekit-$VERSION.pom"
+          cp beekit-bom/pom.xml "target/release/assets/beekit-bom-$VERSION.pom"
+          cp beekit-oss/pom.xml "target/release/assets/beekit-oss-$VERSION.pom"
+          git rev-parse HEAD > target/release/commit
+
+          awk -v heading="## $VERSION" '
+            copying && /^##[[:space:]]/ { exit }
+            $0 == heading { copying = 1; next }
+            copying { print }
+          ' CHANGELOG.md > target/release/notes.md
+          if ! grep -q '[^[:space:]]' target/release/notes.md; then
+            echo "::error::CHANGELOG.md must contain a non-empty section headed ## $VERSION."
+            exit 1
+          fi
+
+      - name: Upload staged files for the release job
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: beekit-release-${{ github.run_attempt }}
+          path: target/release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download staged files
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: release
+
+      - name: Upload and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fxq -- "$GITHUB_REF_NAME" <<< "$tags"; then
+            echo "::error::A release or draft already exists for this tag."
+            exit 1
+          fi
+
+          files=(release/assets/*)
+          if [[ "${#files[@]}" -ne 6 || ! -s release/notes.md || ! -s release/commit ]]; then
+            echo "::error::Expected six release files, release notes, and a build commit."
+            exit 1
+          fi
+          commit=$(cat release/commit)
+          require_current_tag() {
+            current=$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$GITHUB_REF_NAME" --jq '.sha')
+            if [[ "$current" != "$commit" ]]; then
+              echo "::error::The tag no longer points to the commit used to build these assets."
+              exit 1
+            fi
+          }
+          require_current_tag
+          draft_url=$(gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --draft --target "$commit" --title "BeeKit $GITHUB_REF_NAME" --notes-file release/notes.md)
+
+          expected=$(printf '%s\n' "${files[@]##*/}" | sort)
+          draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId,url,isDraft,assets)
+          uploaded=$(jq -r --arg url "$draft_url" 'select(.isDraft and .url == $url)
+            | .assets[] | select(.state == "uploaded" and .size > 0) | .name' <<< "$draft" | sort)
+          if [[ "$uploaded" != "$expected" ]]; then
+            echo "::error::Draft is missing expected release assets."
+            exit 1
+          fi
+
+          draft_id=$(jq -er '.databaseId | select(type == "number" and . > 0)' <<< "$draft")
+          require_current_tag
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$draft_id" \
+            -f tag_name="$GITHUB_REF_NAME" -F draft=false --jq '.html_url'
